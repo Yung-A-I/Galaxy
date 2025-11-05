@@ -94,6 +94,9 @@ const pointer = {
   spinAccumulator: 0
 };
 
+const activeTouchPointers = new Map();
+let pinchLastDistance = null;
+
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
@@ -103,6 +106,80 @@ function limitCameraOffset() {
   const limit = galaxyRadius * 0.95;
   cameraOffsetX = clamp(cameraOffsetX, -limit, limit);
   cameraOffsetY = clamp(cameraOffsetY, -limit, limit);
+}
+
+function storeTouchPointer(event) {
+  if (event.pointerType !== 'touch') return;
+  activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+}
+
+function removeTouchPointer(event) {
+  if (event.pointerType !== 'touch') return;
+  activeTouchPointers.delete(event.pointerId);
+}
+
+function computePinchSnapshot() {
+  if (activeTouchPointers.size < 2) {
+    return null;
+  }
+  const touches = Array.from(activeTouchPointers.values());
+  const first = touches[0];
+  const second = touches[1];
+  const dx = second.x - first.x;
+  const dy = second.y - first.y;
+  const distance = Math.hypot(dx, dy);
+  return {
+    distance,
+    centerX: (first.x + second.x) / 2,
+    centerY: (first.y + second.y) / 2
+  };
+}
+
+function applyZoomFromClient(factor, clientX = centerX, clientY = centerY) {
+  if (!Number.isFinite(factor) || factor === 0 || !Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+    return;
+  }
+
+  const prevZoom = zoom;
+  const newZoom = clamp(prevZoom * factor, MIN_ZOOM, MAX_ZOOM);
+  if (newZoom === prevZoom) {
+    return;
+  }
+
+  const zoomingOut = newZoom < prevZoom;
+
+  if (zoomingOut) {
+    zoom = newZoom;
+    if (prevZoom > 0) {
+      const decay = Math.pow(newZoom / prevZoom, 0.65);
+      cameraOffsetX = baseCameraOffsetX + (cameraOffsetX - baseCameraOffsetX) * decay;
+      cameraOffsetY = baseCameraOffsetY + (cameraOffsetY - baseCameraOffsetY) * decay;
+    }
+
+    const pullStrength = clamp(1 - newZoom / BASE_ZOOM, 0, 1);
+    const pull = 0.18 + pullStrength * 0.55;
+    const damping = clamp(1 - pull, 0, 1);
+    cameraOffsetX = baseCameraOffsetX + (cameraOffsetX - baseCameraOffsetX) * damping;
+    cameraOffsetY = baseCameraOffsetY + (cameraOffsetY - baseCameraOffsetY) * damping;
+
+    if (Math.abs(cameraOffsetX - baseCameraOffsetX) < 0.01) cameraOffsetX = baseCameraOffsetX;
+    if (Math.abs(cameraOffsetY - baseCameraOffsetY) < 0.01) cameraOffsetY = baseCameraOffsetY;
+  } else {
+    const worldX = cameraOffsetX + (clientX - centerX) / prevZoom;
+    const worldY = cameraOffsetY + (clientY - centerY) / prevZoom;
+
+    zoom = newZoom;
+    cameraOffsetX = worldX - (clientX - centerX) / zoom;
+    cameraOffsetY = worldY - (clientY - centerY) / zoom;
+  }
+
+  if (Math.abs(zoom - BASE_ZOOM) < 0.01) {
+    zoom = BASE_ZOOM;
+    cameraOffsetX = baseCameraOffsetX;
+    cameraOffsetY = baseCameraOffsetY;
+  }
+
+  limitCameraOffset();
 }
 
 function resize() {
@@ -429,21 +506,65 @@ function animate() {
 
 function setupInteractions() {
   canvas.addEventListener('pointerdown', (event) => {
-    pointer.dragging = true;
-    pointer.lastX = event.clientX;
-    pointer.lastY = event.clientY;
-    pointer.lastTime = performance.now();
-    pointer.yawVelocity = 0;
-    pointer.pitchVelocity = 0;
-    pointer.spinAccumulator = 0;
-    spinVelocity = 0;
+    storeTouchPointer(event);
+
+    if (event.pointerType === 'touch' && activeTouchPointers.size > 1) {
+      pointer.dragging = false;
+      pointer.yawVelocity = 0;
+      pointer.pitchVelocity = 0;
+      pointer.spinAccumulator = 0;
+      spinVelocity = 0;
+      const pinch = computePinchSnapshot();
+      pinchLastDistance = pinch ? pinch.distance : null;
+    } else {
+      pointer.dragging = true;
+      pointer.lastX = event.clientX;
+      pointer.lastY = event.clientY;
+      pointer.lastTime = performance.now();
+      pointer.yawVelocity = 0;
+      pointer.pitchVelocity = 0;
+      pointer.spinAccumulator = 0;
+      spinVelocity = 0;
+      pinchLastDistance = null;
+    }
+
     if (canvas.setPointerCapture) {
       canvas.setPointerCapture(event.pointerId);
     }
   });
 
   canvas.addEventListener('pointermove', (event) => {
+    if (event.pointerType === 'touch') {
+      storeTouchPointer(event);
+      const pinch = computePinchSnapshot();
+      if (pinch) {
+        if (pinchLastDistance && pinchLastDistance > 0) {
+          const factor = clamp(pinch.distance / pinchLastDistance, 0.7, 1.3);
+          applyZoomFromClient(factor, pinch.centerX, pinch.centerY);
+        }
+        pinchLastDistance = pinch.distance;
+        pointer.dragging = false;
+        pointer.yawVelocity = 0;
+        pointer.pitchVelocity = 0;
+        pointer.spinAccumulator = 0;
+        spinVelocity = 0;
+        return;
+      }
+      pinchLastDistance = null;
+      if (!pointer.dragging) {
+        pointer.dragging = true;
+        pointer.lastX = event.clientX;
+        pointer.lastY = event.clientY;
+        pointer.lastTime = performance.now();
+        pointer.yawVelocity = 0;
+        pointer.pitchVelocity = 0;
+        pointer.spinAccumulator = 0;
+        spinVelocity = 0;
+      }
+    }
+
     if (!pointer.dragging) return;
+
     const dx = event.clientX - pointer.lastX;
     const dy = event.clientY - pointer.lastY;
     const now = performance.now();
@@ -464,7 +585,7 @@ function setupInteractions() {
     pointer.yawVelocity = clamp(yawDelta / dt, -MAX_SPIN_VELOCITY, MAX_SPIN_VELOCITY);
     pointer.pitchVelocity = pitchDelta / dt;
     pointer.spinAccumulator += dx;
-    if (Math.abs(pointer.spinAccumulator) > 2) {
+    if (Math.abs(pointer.spinAccumulator) > 1.5) {
       const dragDir = Math.sign(pointer.spinAccumulator);
       if (dragDir !== 0) {
         orbitDirection = dragDir;
@@ -477,8 +598,25 @@ function setupInteractions() {
   });
 
   const endDrag = (event) => {
+    removeTouchPointer(event);
+
+    const pinch = computePinchSnapshot();
     if (!pointer.dragging) {
       pointer.spinAccumulator = 0;
+      pinchLastDistance = pinch ? pinch.distance : null;
+
+      if (!pinch && activeTouchPointers.size === 1) {
+        const remaining = activeTouchPointers.values().next().value;
+        pointer.dragging = true;
+        pointer.lastX = remaining.x;
+        pointer.lastY = remaining.y;
+        pointer.lastTime = performance.now();
+        pointer.yawVelocity = 0;
+        pointer.pitchVelocity = 0;
+        pointer.spinAccumulator = 0;
+        spinVelocity = 0;
+      }
+
       if (event && canvas.releasePointerCapture) {
         try {
           canvas.releasePointerCapture(event.pointerId);
@@ -511,6 +649,18 @@ function setupInteractions() {
         // ignore release errors when pointer already ended
       }
     }
+
+    if (activeTouchPointers.size === 1) {
+      const remaining = activeTouchPointers.values().next().value;
+      pointer.dragging = true;
+      pointer.lastX = remaining.x;
+      pointer.lastY = remaining.y;
+      pointer.lastTime = performance.now();
+      pointer.yawVelocity = 0;
+      pointer.pitchVelocity = 0;
+      pointer.spinAccumulator = 0;
+      spinVelocity = 0;
+    }
   };
 
   canvas.addEventListener('pointerup', endDrag);
@@ -519,49 +669,19 @@ function setupInteractions() {
 
   canvas.addEventListener('wheel', (event) => {
     event.preventDefault();
-    const prevZoom = zoom;
     const factor = Math.exp(-event.deltaY * 0.0015);
-    const newZoom = clamp(prevZoom * factor, MIN_ZOOM, MAX_ZOOM);
-    const zoomingOut = newZoom < prevZoom;
-
-    if (zoomingOut) {
-      zoom = newZoom;
-      if (prevZoom > 0) {
-        const decay = Math.pow(newZoom / prevZoom, 0.65);
-        cameraOffsetX = baseCameraOffsetX + (cameraOffsetX - baseCameraOffsetX) * decay;
-        cameraOffsetY = baseCameraOffsetY + (cameraOffsetY - baseCameraOffsetY) * decay;
-      }
-
-      const pullStrength = clamp(1 - newZoom / BASE_ZOOM, 0, 1);
-      const pull = 0.18 + pullStrength * 0.55;
-      const damping = clamp(1 - pull, 0, 1);
-      cameraOffsetX = baseCameraOffsetX + (cameraOffsetX - baseCameraOffsetX) * damping;
-      cameraOffsetY = baseCameraOffsetY + (cameraOffsetY - baseCameraOffsetY) * damping;
-
-      if (Math.abs(cameraOffsetX - baseCameraOffsetX) < 0.01) cameraOffsetX = baseCameraOffsetX;
-      if (Math.abs(cameraOffsetY - baseCameraOffsetY) < 0.01) cameraOffsetY = baseCameraOffsetY;
-    } else {
-      const { clientX, clientY } = event;
-      const worldX = cameraOffsetX + (clientX - centerX) / prevZoom;
-      const worldY = cameraOffsetY + (clientY - centerY) / prevZoom;
-
-      zoom = newZoom;
-      cameraOffsetX = worldX - (clientX - centerX) / zoom;
-      cameraOffsetY = worldY - (clientY - centerY) / zoom;
-    }
-
-    if (Math.abs(zoom - BASE_ZOOM) < 0.01) {
-      zoom = BASE_ZOOM;
-      cameraOffsetX = baseCameraOffsetX;
-      cameraOffsetY = baseCameraOffsetY;
-    }
-
-    limitCameraOffset();
+    applyZoomFromClient(factor, event.clientX, event.clientY);
   }, { passive: false });
 
   window.addEventListener('resize', resize);
   window.addEventListener('blur', () => {
     pointer.dragging = false;
+    activeTouchPointers.clear();
+    pinchLastDistance = null;
+    pointer.spinAccumulator = 0;
+    pointer.yawVelocity = 0;
+    pointer.pitchVelocity = 0;
+    spinVelocity = 0;
   });
 }
 
