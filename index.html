@@ -56,6 +56,7 @@ const MAX_SPIN_VELOCITY = 0.042;
 const SPIN_DECAY_PER_MS = 0.99955;
 const SPIN_EJECTION_THRESHOLD = 0.0013;
 const SPIN_EJECTION_GAIN = 0.0045;
+const TWO_PI = Math.PI * 2;
 const RELEASE_EJECTION_GAIN = 1.25;
 const MAX_EJECTION_LEVEL = 3.2;
 const EJECTION_DECAY_PER_MS = 0.0006;
@@ -99,6 +100,14 @@ let pinchLastDistance = null;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function wrapAngle(angle) {
+  if (!Number.isFinite(angle)) {
+    return 0;
+  }
+  angle = ((angle + Math.PI) % TWO_PI + TWO_PI) % TWO_PI - Math.PI;
+  return angle;
 }
 
 function limitCameraOffset() {
@@ -479,7 +488,7 @@ function animate() {
   if (Math.abs(spinVelocity) < 0.00001) {
     spinVelocity = 0;
   } else {
-    yaw += spinVelocity * delta;
+    yaw = wrapAngle(yaw + spinVelocity * delta);
   }
   orbitDirection = orbitDirection || 1;
 
@@ -573,18 +582,19 @@ function setupInteractions() {
       dt = 16;
     }
 
-    const yawDelta = dx * 0.003;
+    const yawDirection = Math.cos(pitch) >= 0 ? 1 : -1;
+    const yawDelta = dx * 0.003 * yawDirection;
     const pitchDelta = dy * 0.003;
 
-    yaw += yawDelta;
+    yaw = wrapAngle(yaw + yawDelta);
     if (yawDelta !== 0) {
       orbitDirection = Math.sign(yawDelta);
     }
-    pitch = clamp(pitch + pitchDelta, -Math.PI / 2 + 0.08, Math.PI / 2 - 0.08);
+    pitch = wrapAngle(pitch + pitchDelta);
 
     pointer.yawVelocity = clamp(yawDelta / dt, -MAX_SPIN_VELOCITY, MAX_SPIN_VELOCITY);
     pointer.pitchVelocity = pitchDelta / dt;
-    pointer.spinAccumulator += dx;
+    pointer.spinAccumulator += dx * yawDirection;
     if (Math.abs(pointer.spinAccumulator) > 1.5) {
       const dragDir = Math.sign(pointer.spinAccumulator);
       if (dragDir !== 0) {
