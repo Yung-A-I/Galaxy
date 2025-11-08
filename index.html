@@ -15,12 +15,12 @@
 
     body {
       margin: 0;
+      min-height: 100vh;
+      font-family: system-ui, sans-serif;
+      background: radial-gradient(ellipse at center, #080819 0%, #020208 100%);
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
-      background: radial-gradient(ellipse at center, #080819 0%, #020208 100%);
-      font-family: system-ui, sans-serif;
     }
 
     canvas {
@@ -37,6 +37,7 @@
     canvas:active {
       cursor: grabbing;
     }
+
   </style>
 </head>
 <body>
@@ -65,8 +66,21 @@ const RADIAL_DRAG = 0.975;
 const RADIAL_RETENTION = 0.64;
 const RADIAL_SETTLE_THRESHOLD = 0.22;
 const RADIAL_SETTLE_DAMP = 0.93;
+const SPARKLE_BASE_DRIFT = 0.00008;
+const SPARKLE_WIND_COUPLING = 0.35;
+const CHAIN_COUNT = 1;
+const CHAIN_LENGTH = 120;
+const CHAIN_SPACING = 5;
+const CHAIN_BASE_SPEED = 0.7;
+const CHAIN_GRAVITY = 0.00016;
+const CHAIN_SPAWN_CHANCE = 0.0065;
+const CHAIN_BUFFER = 320;
+const COLOR_SHIFT_RANGE_DEG = 360;
+const COLOR_PITCH_RANGE = Math.PI * 1.75; // larger value = slower change
+const INITIAL_PITCH = 0.58;
 const particles = [];
 const sparkles = [];
+const chains = [];
 let width = 0;
 let height = 0;
 let centerX = 0;
@@ -75,12 +89,15 @@ let galaxyRadius = 0;
 let baseDistance = 0;
 let zoom = BASE_ZOOM;
 let yaw = 0.38;
-let pitch = 0.58;
+let pitch = INITIAL_PITCH;
+let sparkleYaw = yaw;
+let sparklePitch = pitch;
 let cameraOffsetX = 0;
 let cameraOffsetY = 0;
 let baseCameraOffsetX = 0;
 let baseCameraOffsetY = 0;
 let spinVelocity = 0;
+let sparkleSpinVelocity = SPARKLE_BASE_DRIFT;
 let ejectionLevel = 0;
 let lastFrameTime = performance.now();
 let orbitDirection = 1;
@@ -92,7 +109,8 @@ const pointer = {
   lastTime: 0,
   yawVelocity: 0,
   pitchVelocity: 0,
-  spinAccumulator: 0
+  spinAccumulator: 0,
+  affectsSparkles: false
 };
 
 const activeTouchPointers = new Map();
@@ -115,6 +133,10 @@ function limitCameraOffset() {
   const limit = galaxyRadius * 0.95;
   cameraOffsetX = clamp(cameraOffsetX, -limit, limit);
   cameraOffsetY = clamp(cameraOffsetY, -limit, limit);
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
 }
 
 function storeTouchPointer(event) {
@@ -142,6 +164,23 @@ function computePinchSnapshot() {
     centerX: (first.x + second.x) / 2,
     centerY: (first.y + second.y) / 2
   };
+}
+
+function isPointInsideGalaxy(clientX, clientY) {
+  if (!canvas || !galaxyRadius) {
+    return false;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const x = (clientX - rect.left) * scaleX;
+  const y = (clientY - rect.top) * scaleY;
+  const focusX = centerX - cameraOffsetX * zoom;
+  const focusY = centerY - cameraOffsetY * zoom;
+  const dx = x - focusX;
+  const dy = y - focusY;
+  const threshold = galaxyRadius * zoom * 0.85;
+  return dx * dx + dy * dy <= threshold * threshold;
 }
 
 function applyZoomFromClient(factor, clientX = centerX, clientY = centerY) {
@@ -222,6 +261,10 @@ function resize() {
 
   limitCameraOffset();
   initSparkles();
+  initChains();
+  sparkleYaw = yaw;
+  sparklePitch = pitch;
+  sparkleSpinVelocity = SPARKLE_BASE_DRIFT;
 }
 
 function initParticles() {
@@ -237,7 +280,7 @@ function initParticles() {
     const arm = Math.floor(Math.random() * armCount);
     const armOffset = arm * (Math.PI * 2 / armCount);
     const angleJitter = (Math.random() - 0.5) * 0.32;
-    const hue = 190 + Math.random() * 50;
+    const baseHue = 190 + Math.random() * 50;
     const lightness = 55 + Math.random() * 25;
     const alpha = 0.38 + Math.random() * 0.42;
 
@@ -251,14 +294,17 @@ function initParticles() {
       armOffset,
       angleJitter,
       size: (0.6 + Math.random() * 1.4) * (0.55 + (1 - radiusNorm) * 0.9),
-      color: `hsla(${hue}, 80%, ${lightness}%, ${alpha})`,
       glow: 0.16 + Math.random() * 0.45,
       noisePhase: Math.random() * Math.PI * 2,
       escapeWeight: 0.4 + Math.random() * 1.2,
       escapePhase: Math.random() * Math.PI * 2,
       escapeCurve: 0.6 + Math.random() * 0.8,
       radialOffset: 0,
-      radialVelocity: 0
+      radialVelocity: 0,
+      bandPosition: Math.random(),
+      baseHue,
+      lightness,
+      alpha
     });
   }
 }
@@ -279,8 +325,50 @@ function initSparkles() {
       flickerPhase: Math.random() * Math.PI * 2,
       flickerSpeed: 0.001 + Math.random() * 0.0015,
       size: 0.6 + Math.random() * 2.2,
-      hue: 185 + Math.random() * 70
+      bandPosition: Math.random(),
+      baseHue: 185 + Math.random() * 70
     });
+  }
+}
+
+function createChain() {
+  const edge = Math.floor(Math.random() * 4);
+  let x, y, vx, vy;
+  switch (edge) {
+    case 0:
+      x = Math.random() * width;
+      y = -CHAIN_BUFFER;
+      vx = (Math.random() - 0.5) * 0.5;
+      vy = Math.random() * 0.6 + 0.4;
+      break;
+    case 1:
+      x = Math.random() * width;
+      y = height + CHAIN_BUFFER;
+      vx = (Math.random() - 0.5) * 0.5;
+      vy = -(Math.random() * 0.6 + 0.4);
+      break;
+    case 2:
+      x = -CHAIN_BUFFER;
+      y = Math.random() * height;
+      vx = Math.random() * 0.6 + 0.4;
+      vy = (Math.random() - 0.5) * 0.5;
+      break;
+    default:
+      x = width + CHAIN_BUFFER;
+      y = Math.random() * height;
+      vx = -(Math.random() * 0.6 + 0.4);
+      vy = (Math.random() - 0.5) * 0.5;
+      break;
+  }
+  const speed = CHAIN_BASE_SPEED * (0.6 + Math.random() * 0.6);
+  const hue = 200 + Math.random() * 80;
+  return { x, y, vx, vy, speed, hue, alpha: 0.25 + Math.random() * 0.25 };
+}
+
+function initChains() {
+  chains.length = 0;
+  for (let i = 0; i < CHAIN_COUNT; i++) {
+    chains.push(createChain());
   }
 }
 
@@ -329,6 +417,79 @@ function drawCore(focusX, focusY) {
   ctx.restore();
 }
 
+function updateChains(delta, focusX, focusY) {
+  if (chains.length < CHAIN_COUNT && Math.random() < CHAIN_SPAWN_CHANCE) {
+    chains.push(createChain());
+  }
+  if (!chains.length) return;
+  const dt = Math.max(0.5, delta / 16);
+  for (let i = 0; i < chains.length; i++) {
+    const chain = chains[i];
+    const dx = focusX - chain.x;
+    const dy = focusY - chain.y;
+    const distance = Math.hypot(dx, dy) + 1;
+    const grav = CHAIN_GRAVITY * dt;
+    chain.vx += (dx / distance) * grav;
+    chain.vy += (dy / distance) * grav;
+    const mag = Math.hypot(chain.vx, chain.vy) || 1;
+    chain.vx /= mag;
+    chain.vy /= mag;
+    const step = chain.speed * dt * 0.8 * (0.5 + zoom * 0.3);
+    chain.x += chain.vx * step * 16;
+    chain.y += chain.vy * step * 16;
+
+    if (
+      chain.x < -CHAIN_BUFFER ||
+      chain.x > width + CHAIN_BUFFER ||
+      chain.y < -CHAIN_BUFFER ||
+      chain.y > height + CHAIN_BUFFER
+    ) {
+      chains.splice(i, 1);
+      i--;
+    }
+  }
+}
+
+function drawChains(hueShift, pitchBlend, focusX, focusY) {
+  if (!chains.length) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  for (const chain of chains) {
+    const baseHue = (chain.hue + hueShift * 0.4) % 360;
+    const headBrightness = 90;
+    const tailBrightness = 35;
+    for (let s = 0; s < CHAIN_LENGTH; s++) {
+      const fade = 1 - s / CHAIN_LENGTH;
+      if (fade <= 0.01) break;
+      const px = chain.x - chain.vx * CHAIN_SPACING * s;
+      const py = chain.y - chain.vy * CHAIN_SPACING * s;
+      ctx.globalAlpha = chain.alpha * fade * 0.8;
+      const brightness = lerp(headBrightness, tailBrightness, s / CHAIN_LENGTH);
+      const size = 1 + fade * 1.5;
+      ctx.fillStyle = `hsla(${baseHue}, 80%, ${brightness}%, 1)`;
+      ctx.beginPath();
+      ctx.arc(px, py, size, 0, TWO_PI);
+      ctx.fill();
+
+      if (s === 0) {
+        ctx.globalAlpha = chain.alpha * 0.8;
+        ctx.fillStyle = `hsla(${baseHue}, 95%, 95%, 1)`;
+        ctx.beginPath();
+        ctx.arc(px, py, size * 1.4, 0, TWO_PI);
+        ctx.fill();
+
+        ctx.globalAlpha = chain.alpha * 0.45;
+        ctx.beginPath();
+        ctx.arc(px, py, size * 2.3, 0, TWO_PI);
+        ctx.fill();
+      }
+    }
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+
 function renderParticles(time, focusX, focusY, delta) {
   const viewDistance = baseDistance;
   const cosYaw = Math.cos(yaw);
@@ -341,6 +502,9 @@ function renderParticles(time, focusX, focusY, delta) {
   const dt = Math.max(0.1, delta / 16);
   const drag = Math.pow(RADIAL_DRAG, dt);
   const rotationSign = orbitDirection || 1;
+  const pitchOffset = wrapAngle(pitch - INITIAL_PITCH);
+  const colorBlend = clamp(Math.abs(pitchOffset) / COLOR_PITCH_RANGE, 0, 1);
+  const hueShift = colorBlend * COLOR_SHIFT_RANGE_DEG;
 
   for (const particle of particles) {
     particle.angle += particle.orbitalSpeed * rotationSign;
@@ -390,13 +554,16 @@ function renderParticles(time, focusX, focusY, delta) {
     const screenX = x * perspective;
     const screenY = y * perspective;
 
+    const hue = (particle.baseHue + hueShift) % 360;
+    const color = `hsla(${hue}, 80%, ${particle.lightness}%, ${particle.alpha})`;
+
     items.push({
       depth: z,
       x: focusX + screenX * zoom,
       y: focusY + screenY * zoom,
       size: Math.max(0.12, particle.size * perspective * Math.pow(zoom, 0.16) * (1 + particle.radialOffset * 0.18)),
       glow: particle.glow * perspective * (0.8 / Math.pow(zoom, 0.08)) * (1 + particle.radialOffset * 0.22),
-      color: particle.color
+      color
     });
   }
 
@@ -429,10 +596,13 @@ function renderSparkles(time, focusX, focusY) {
   }
 
   const viewDistance = baseDistance * 1.1;
-  const cosYaw = Math.cos(yaw);
-  const sinYaw = Math.sin(yaw);
-  const cosPitch = Math.cos(pitch);
-  const sinPitch = Math.sin(pitch);
+  const cosYaw = Math.cos(sparkleYaw);
+  const sinYaw = Math.sin(sparkleYaw);
+  const cosPitch = Math.cos(sparklePitch);
+  const sinPitch = Math.sin(sparklePitch);
+  const pitchOffset = wrapAngle(pitch - INITIAL_PITCH);
+  const colorBlend = clamp(Math.abs(pitchOffset) / COLOR_PITCH_RANGE, 0, 1);
+  const hueShift = colorBlend * COLOR_SHIFT_RANGE_DEG;
 
   ctx.save();
   ctx.globalCompositeOperation = 'screen';
@@ -460,9 +630,10 @@ function renderSparkles(time, focusX, focusY) {
     const flicker = Math.pow(Math.max(0, Math.sin(time * sparkle.flickerSpeed + sparkle.flickerPhase)), 1.6);
     const alpha = (0.12 + flicker * 0.55) * (1 + Math.min(1, ejectionLevel) * 0.4);
     const radius = sparkle.size * perspective * (0.5 + flicker * 0.9) * Math.pow(zoom, 0.08) * (1 + Math.min(1, ejectionLevel) * 0.25);
+    const hue = (sparkle.baseHue + hueShift) % 360;
 
     ctx.globalAlpha = alpha;
-    ctx.fillStyle = `hsla(${sparkle.hue}, 90%, 78%, 1)`;
+    ctx.fillStyle = `hsla(${hue}, 90%, 78%, 1)`;
     ctx.beginPath();
     ctx.arc(focusX + screenX * zoom, focusY + screenY * zoom, radius, 0, Math.PI * 2);
     ctx.fill();
@@ -484,6 +655,10 @@ function animate() {
   if (pointer.dragging) {
     spinVelocity = 0;
   }
+  sparkleSpinVelocity *= Math.pow(SPIN_DECAY_PER_MS, delta);
+  if (pointer.dragging && pointer.affectsSparkles) {
+    sparkleSpinVelocity = SPARKLE_BASE_DRIFT;
+  }
 
   if (Math.abs(spinVelocity) < 0.00001) {
     spinVelocity = 0;
@@ -491,6 +666,15 @@ function animate() {
     yaw = wrapAngle(yaw + spinVelocity * delta);
   }
   orbitDirection = orbitDirection || 1;
+  if (!pointer.affectsSparkles || !pointer.dragging) {
+    const targetSpin = (spinVelocity !== 0 ? Math.sign(spinVelocity) : Math.sign(sparkleSpinVelocity || 1)) *
+      (SPARKLE_BASE_DRIFT + Math.min(0.0004, Math.abs(spinVelocity) * SPARKLE_WIND_COUPLING));
+    sparkleSpinVelocity += (targetSpin - sparkleSpinVelocity) * 0.05;
+  }
+  if (Math.abs(sparkleSpinVelocity) < 0.00001) {
+    sparkleSpinVelocity = Math.sign(sparkleSpinVelocity || 1) * SPARKLE_BASE_DRIFT;
+  }
+  sparkleYaw = wrapAngle(sparkleYaw + sparkleSpinVelocity * delta);
 
   const spinAbs = Math.abs(spinVelocity);
   if (spinAbs > SPIN_EJECTION_THRESHOLD) {
@@ -502,10 +686,15 @@ function animate() {
 
   const focusX = centerX - cameraOffsetX * zoom;
   const focusY = centerY - cameraOffsetY * zoom;
+  const pitchOffset = wrapAngle(pitch - INITIAL_PITCH);
+  const colorBlend = clamp(Math.abs(pitchOffset) / COLOR_PITCH_RANGE, 0, 1);
+  const hueShift = colorBlend * COLOR_SHIFT_RANGE_DEG;
 
   fillBackground();
   drawDust(focusX, focusY);
   drawCore(focusX, focusY);
+  updateChains(delta, focusX, focusY);
+  drawChains(hueShift, colorBlend, focusX, focusY);
   renderParticles(time, focusX, focusY, delta);
   renderSparkles(time, focusX, focusY);
 
@@ -523,6 +712,7 @@ function setupInteractions() {
       pointer.pitchVelocity = 0;
       pointer.spinAccumulator = 0;
       spinVelocity = 0;
+      pointer.affectsSparkles = false;
       const pinch = computePinchSnapshot();
       pinchLastDistance = pinch ? pinch.distance : null;
     } else {
@@ -535,6 +725,10 @@ function setupInteractions() {
       pointer.spinAccumulator = 0;
       spinVelocity = 0;
       pinchLastDistance = null;
+      pointer.affectsSparkles = !isPointInsideGalaxy(event.clientX, event.clientY);
+      if (pointer.affectsSparkles) {
+        sparkleSpinVelocity = 0;
+      }
     }
 
     if (canvas.setPointerCapture) {
@@ -557,6 +751,7 @@ function setupInteractions() {
         pointer.pitchVelocity = 0;
         pointer.spinAccumulator = 0;
         spinVelocity = 0;
+        pointer.affectsSparkles = false;
         return;
       }
       pinchLastDistance = null;
@@ -569,6 +764,10 @@ function setupInteractions() {
         pointer.pitchVelocity = 0;
         pointer.spinAccumulator = 0;
         spinVelocity = 0;
+        pointer.affectsSparkles = !isPointInsideGalaxy(event.clientX, event.clientY);
+        if (pointer.affectsSparkles) {
+          sparkleSpinVelocity = 0;
+        }
       }
     }
 
@@ -585,12 +784,18 @@ function setupInteractions() {
     const yawDirection = Math.cos(pitch) >= 0 ? 1 : -1;
     const yawDelta = dx * 0.003 * yawDirection;
     const pitchDelta = dy * 0.003;
+    const sparkleYawDirection = Math.cos(sparklePitch) >= 0 ? 1 : -1;
+    const sparkleYawDelta = dx * 0.003 * sparkleYawDirection;
 
     yaw = wrapAngle(yaw + yawDelta);
     if (yawDelta !== 0) {
       orbitDirection = Math.sign(yawDelta);
     }
     pitch = wrapAngle(pitch + pitchDelta);
+    if (pointer.affectsSparkles) {
+      sparkleYaw = wrapAngle(sparkleYaw + sparkleYawDelta);
+      sparklePitch = wrapAngle(sparklePitch + pitchDelta);
+    }
 
     pointer.yawVelocity = clamp(yawDelta / dt, -MAX_SPIN_VELOCITY, MAX_SPIN_VELOCITY);
     pointer.pitchVelocity = pitchDelta / dt;
@@ -625,6 +830,10 @@ function setupInteractions() {
         pointer.pitchVelocity = 0;
         pointer.spinAccumulator = 0;
         spinVelocity = 0;
+        pointer.affectsSparkles = !isPointInsideGalaxy(remaining.x, remaining.y);
+        if (pointer.affectsSparkles) {
+          sparkleSpinVelocity = 0;
+        }
       }
 
       if (event && canvas.releasePointerCapture) {
@@ -637,8 +846,13 @@ function setupInteractions() {
       return;
     }
 
+    const dragAffectedSparkles = pointer.affectsSparkles;
     pointer.dragging = false;
+    pointer.affectsSparkles = false;
     spinVelocity = clamp(pointer.yawVelocity, -MAX_SPIN_VELOCITY, MAX_SPIN_VELOCITY);
+    sparkleSpinVelocity = dragAffectedSparkles
+      ? clamp(pointer.yawVelocity, -MAX_SPIN_VELOCITY, MAX_SPIN_VELOCITY)
+      : sparkleSpinVelocity;
     const dragDir = Math.sign(pointer.spinAccumulator);
     if (dragDir !== 0) {
       orbitDirection = dragDir;
@@ -670,6 +884,10 @@ function setupInteractions() {
       pointer.pitchVelocity = 0;
       pointer.spinAccumulator = 0;
       spinVelocity = 0;
+      pointer.affectsSparkles = !isPointInsideGalaxy(remaining.x, remaining.y);
+      if (pointer.affectsSparkles) {
+        sparkleSpinVelocity = 0;
+      }
     }
   };
 
@@ -692,12 +910,15 @@ function setupInteractions() {
     pointer.yawVelocity = 0;
     pointer.pitchVelocity = 0;
     spinVelocity = 0;
+    sparkleSpinVelocity = 0;
+    pointer.affectsSparkles = false;
   });
 }
 
 resize();
 initParticles();
 initSparkles();
+initChains();
 setupInteractions();
 animate();
 </script>
